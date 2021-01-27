@@ -5,8 +5,11 @@ use stm32f7xx_hal::device as stm32;
 
 use stm32::ETHERNET_DMA;
 
-use core::default::Default;
-use core::ops::{Deref, DerefMut};
+use core::{
+    default::Default,
+    ops::{Deref, DerefMut},
+    sync::atomic::{self, Ordering},
+};
 
 use crate::{
     desc::Descriptor,
@@ -47,15 +50,18 @@ pub struct RxDescriptor {
 
 impl Default for RxDescriptor {
     fn default() -> Self {
-        let mut desc = Descriptor::default();
-        unsafe {
-            desc.write(1, RXDESC_1_RCH);
-        }
-        RxDescriptor { desc }
+        Self::new()
     }
 }
 
 impl RxDescriptor {
+    /// Creates an zeroed RxDescriptor.
+    pub const fn new() -> Self {
+        Self {
+            desc: Descriptor::new(),
+        }
+    }
+
     /// Is owned by the DMA engine?
     fn is_owned(&self) -> bool {
         (self.desc.read(0) & RXDESC_0_OWN) == RXDESC_0_OWN
@@ -63,9 +69,19 @@ impl RxDescriptor {
 
     /// Pass ownership to the DMA engine
     fn set_owned(&mut self) {
+        // "Preceding reads and writes cannot be moved past subsequent writes."
+        #[cfg(feature = "fence")]
+        atomic::fence(Ordering::Release);
+
+        atomic::compiler_fence(Ordering::Release);
         unsafe {
             self.desc.modify(0, |w| w | RXDESC_0_OWN);
         }
+
+        // Used to flush the store buffer as fast as possible to make the buffer available for the
+        // DMA.
+        #[cfg(feature = "fence")]
+        atomic::fence(Ordering::SeqCst);
     }
 
     fn has_error(&self) -> bool {
@@ -113,6 +129,10 @@ pub type RxRingEntry = RingEntry<RxDescriptor>;
 
 impl RingDescriptor for RxDescriptor {
     fn setup(&mut self, buffer: *const u8, len: usize, next: Option<&Self>) {
+        // Defer this initialization to this function, so we can have `RingEntry` on bss.
+        unsafe {
+            self.desc.write(1, RXDESC_1_RCH);
+        }
         self.set_buffer1(buffer, len);
         match next {
             Some(next) => self.set_buffer2(&next.desc as *const Descriptor as *const u8),
@@ -135,6 +155,9 @@ impl RxRingEntry {
             Err(RxError::DmaError)
         } else if self.desc().is_first() && self.desc().is_last() {
             let frame_len = self.desc().get_frame_len();
+
+            // "Subsequent reads and writes cannot be moved ahead of preceding reads."
+            atomic::compiler_fence(Ordering::Acquire);
 
             // TODO: obtain ethernet frame type (RDESC_1_FT)
             let pkt = RxPacket {
@@ -215,6 +238,8 @@ impl<'a> RxRing<'a> {
         let ring_ptr = self.entries[0].desc() as *const RxDescriptor;
         // Register RxDescriptor
         eth_dma.dmardlar.write(|w| w.srl().bits(ring_ptr as u32));
+
+        // We already have fences in `set_owned`, which is called in `setup`
 
         // Start receive
         eth_dma.dmaomr.modify(|_, w| w.sr().set_bit());

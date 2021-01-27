@@ -12,7 +12,7 @@ Please send pull requests.
 ## Building Examples
 ```
 cargo build --example="pktgen" --features="stm32f429"
-cargo build --example="ip" --features="stm32f429" --features="smoltcp-phy smoltcp-log smoltcp-verbose"
+cargo build --example="ip" --features="stm32f429 smoltcp-phy log smoltcp/socket-tcp smoltcp/socket-icmp smoltcp/log smoltcp/verbose"
 ```
 
 ## Usage
@@ -43,7 +43,7 @@ fn main() {
     let p = Peripherals::take().unwrap();
 
     let rcc = p.RCC.constrain();
-    // HCLK must be between 25MHz and 168MHz to use the ethernet peripheral
+    // HCLK must be at least 25MHz to use the ethernet peripheral
     let clocks = rcc.cfgr.sysclk(32.mhz()).hclk(32.mhz()).freeze();
 
     let gpioa = p.GPIOA.split();

@@ -5,7 +5,10 @@ use stm32f7xx_hal::device as stm32;
 
 use stm32::ETHERNET_DMA;
 
-use core::ops::{Deref, DerefMut};
+use core::{
+    ops::{Deref, DerefMut},
+    sync::atomic::{self, Ordering},
+};
 
 use crate::{
     desc::Descriptor,
@@ -44,15 +47,18 @@ pub struct TxDescriptor {
 
 impl Default for TxDescriptor {
     fn default() -> Self {
-        let mut desc = Descriptor::default();
-        unsafe {
-            desc.write(0, TXDESC_0_TCH | TXDESC_0_IC | TXDESC_0_FS | TXDESC_0_LS);
-        }
-        TxDescriptor { desc }
+        Self::new()
     }
 }
 
 impl TxDescriptor {
+    /// Creates an zeroed TxDescriptor.
+    pub const fn new() -> Self {
+        Self {
+            desc: Descriptor::new(),
+        }
+    }
+
     /// Is owned by the DMA engine?
     fn is_owned(&self) -> bool {
         (self.desc.read(0) & TXDESC_0_OWN) == TXDESC_0_OWN
@@ -60,9 +66,19 @@ impl TxDescriptor {
 
     /// Pass ownership to the DMA engine
     fn set_owned(&mut self) {
+        // "Preceding reads and writes cannot be moved past subsequent writes."
+        #[cfg(feature = "fence")]
+        atomic::fence(Ordering::Release);
+
+        atomic::compiler_fence(Ordering::Release);
         unsafe {
             self.desc.modify(0, |w| w | TXDESC_0_OWN);
         }
+
+        // Used to flush the store buffer as fast as possible to make the buffer available for the
+        // DMA.
+        #[cfg(feature = "fence")]
+        atomic::fence(Ordering::SeqCst);
     }
 
     #[allow(unused)]
@@ -102,6 +118,11 @@ pub type TxRingEntry = RingEntry<TxDescriptor>;
 
 impl RingDescriptor for TxDescriptor {
     fn setup(&mut self, buffer: *const u8, _len: usize, next: Option<&Self>) {
+        // Defer this initialization to this function, so we can have `RingEntry` on bss.
+        unsafe {
+            self.desc
+                .write(0, TXDESC_0_TCH | TXDESC_0_IC | TXDESC_0_FS | TXDESC_0_LS);
+        }
         self.set_buffer1(buffer);
         match next {
             Some(next) => self.set_buffer2(&next.desc as *const Descriptor as *const u8),
@@ -192,6 +213,13 @@ impl<'a> TxRing<'a> {
         let ring_ptr = self.entries[0].desc() as *const TxDescriptor;
         // Register TxDescriptor
         eth_dma.dmatdlar.write(|w| w.stl().bits(ring_ptr as u32));
+
+        // "Preceding reads and writes cannot be moved past subsequent writes."
+        #[cfg(feature = "fence")]
+        atomic::fence(Ordering::Release);
+
+        // We don't need a compiler fence here because all interactions with `Descriptor` are
+        // volatiles
 
         // Start transmission
         eth_dma.dmaomr.modify(|_, w| w.st().set_bit());
